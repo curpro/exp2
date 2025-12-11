@@ -47,8 +47,8 @@ device = torch.device("cpu")
 dtype = torch.double
 
 # 优化参数
-N_INIT = 100  # 初始随机样本点数量 (Warm-up)
-N_BATCH = 150  # 迭代次数 (建议设大一点，比如50-100，让GP充分收敛)
+N_INIT = 200  # 初始随机样本点数量 (Warm-up)
+N_BATCH = 300  # 迭代次数 (建议设大一点，比如50-100，让GP充分收敛)
 BATCH_SIZE = 1  # 每次推荐点数
 MC_SAMPLES = 500  # 蒙特卡洛采样数
 
