@@ -2,18 +2,26 @@ import numpy as np
 
 
 class IMMFilter:
-    def __init__(self, transition_probabilities, initial_state, initial_cov, r_cov=None, omega=None):
+    def __init__(self, transition_probabilities, initial_state, initial_cov, r_cov=None):
         """
-        [修正版] IMM Filter: 9D 状态 (x, vx, ax, y, vy, ay, z, vz, az)
-        模型集合: CA-High Noise, CA-Low Noise, CA-Medium Noise
-        """
-        self.M = 3
-        self.trans_prob = transition_probabilities
-        # 初始概率
-        self.model_probs = np.array([0.4, 0.3, 0.3])
-        self.dim = 9  # <--- 状态维度修正为 9
+        IMM Filter 针对 F-16 轨迹跟踪 (9D State)
+        状态向量 X = [x, vx, ax, y, vy, ay, z, vz, az]
 
-        # 初始化状态
+        模型定义:
+        0. CV (Constant Velocity): 匀速直线，忽略加速度输入 (Low Noise)
+        1. CA (Constant Acceleration): 匀速/变加速直线 (Medium Noise)
+        2. CT (Coordinated Turn): 协同转弯，X-Y 耦合 (High/Specific Noise)
+        """
+        self.dim = 9
+        self.M = 3  # 模型数量
+
+        # 转移概率矩阵
+        self.trans_prob = transition_probabilities
+
+        # 初始模型概率 (均匀分布或自定义)
+        self.model_probs = np.array([0.4, 0.4, 0.2])
+
+        # 初始化状态和协方差
         self.x = np.zeros((self.M, self.dim))
         self.P = np.zeros((self.M, self.dim, self.dim))
 
@@ -21,89 +29,159 @@ class IMMFilter:
             self.x[i] = initial_state.copy()
             self.P[i] = initial_cov.copy()
 
-        # --- 关键修改：基于数据统计特性的 Q 参数 ---
-        # 你的 CA 模型集合 (只通过噪声强度区分)
-        self.q_params = {
-            'ca_low_std': 5.0,  # 低机动 (常规飞行)
-            'ca_medium_std': 25.0,  # 中等机动 (转弯)
-            'ca_high_std': 30.0  # 高机动 (超机动)
-        }
-        self.q_list = [
-            self.q_params['ca_high_std'],
-            self.q_params['ca_low_std'],
-            self.q_params['ca_medium_std'],
+        # --- Q 参数设置 (针对 F-16 的经验值) ---
+        # CV: 假设加速度很小，主要靠速度预测
+        # CA: 允许显著的加速度变化
+        # CT: 允许转弯产生的横向加速度扰动
+        self.q_params = [
+            1.0,  # Model 0: CV (Low noise)
+            25.0,  # Model 1: CA (Medium noise)
+            35.0  # Model 2: CT (High noise to accommodate turn uncertainty)
         ]
 
         # 测量矩阵 H (只观测位置 x, y, z)
+        # indices: x(0), y(3), z(6)
         self.H = np.zeros((3, self.dim))
-        self.H[0, 0] = 1  # x
-        self.H[1, 3] = 1  # y  <--- 索引修正
-        self.H[2, 6] = 1  # z  <--- 索引修正
+        self.H[0, 0] = 1
+        self.H[1, 3] = 1
+        self.H[2, 6] = 1
 
         # 观测噪声 R
         if r_cov is not None:
             self.R = r_cov
         else:
-            self.R = np.eye(3) * 16
+            self.R = np.eye(3) * 100.0
 
-    # --- 修正后的模型 F 矩阵 (常加速度模型) ---
-    def get_F_CA_model(self, dt):
-        """生成 9x9 常加速度 (CA) 模型的转移矩阵"""
+    # =================================================================
+    #  模型 1: CV (Constant Velocity) 匀速模型
+    # =================================================================
+    def get_F_CV(self, dt):
+        """
+        CV 模型矩阵：
+        认为物体做匀速运动，加速度项不参与位置和速度的更新。
+        这能让滤波器在平飞阶段迅速降低对噪声的敏感度。
+        """
         F = np.eye(self.dim)
 
-        # 3x3 CA 块
-        f_block = np.array([
-            [1, dt, dt ** 2 / 2.0],
+        # 仅更新位置：p = p + v*dt (忽略 a)
+        # 仅更新速度：v = v        (忽略 a)
+
+        # X 轴
+        F[0, 1] = dt
+        # Y 轴
+        F[3, 4] = dt
+        # Z 轴
+        F[6, 7] = dt
+
+        return F
+
+    # =================================================================
+    #  模型 2: CA (Constant Acceleration) 常加速模型
+    # =================================================================
+    def get_F_CA(self, dt):
+        """
+        CA 模型矩阵：
+        标准的牛顿运动学，适用于直线加速、爬升、俯冲。
+        """
+        F = np.eye(self.dim)
+
+        # 3x3 运动学块
+        # p = p + v*dt + 0.5*a*dt^2
+        # v = v + a*dt
+        # a = a
+        block = np.array([
+            [1, dt, 0.5 * dt ** 2],
             [0, 1, dt],
             [0, 0, 1]
         ])
 
-        # 组装 9x9 F 矩阵
-        for i in range(3):
-            start = i * 3
-            F[start:start + 3, start:start + 3] = f_block
+        # 填充到 9x9 矩阵
+        for i in [0, 3, 6]:  # 对应 x, y, z 的起始索引
+            F[i:i + 3, i:i + 3] = block
 
         return F
 
-    # --- 修正后的模型 Q 矩阵 (常加速度模型) ---
-    def get_Q_CA_model(self, dt, q_std):
-        """生成 9x9 CA 模型的运动学过程噪声矩阵"""
-        q_var = q_std ** 2
+    # =================================================================
+    #  模型 3: CT (Coordinated Turn) 协同转弯模型
+    # =================================================================
+    def get_F_CT(self, dt, omega=0.15):  # omega 默认为约 8.5度/秒
+        """
+        CT 模型矩阵 (核心修改)：
+        引入 X 和 Y 的耦合，描述水平面的圆周运动。
+        omega: 转弯率 (rad/s)。
+        对于 F-16，转弯率是变化的，这里取一个典型的平均值或通过 EKF 估算。
+        为简单起见，这里使用固定转弯率的线性化模型。
+        """
+        F = np.eye(self.dim)
 
-        # 3x3 Q 块 (常加速度离散模型)
-        q2 = dt ** 2 / 2.0
-        q3 = dt ** 3 / 3.0
+        sin_w = np.sin(omega * dt)
+        cos_w = np.cos(omega * dt)
 
-        q_block = np.array([
-            [q3, q2, dt ** 2 / 4.0],  # 修正：加速度项通常采用 G*Qc*G^T 积分形式，这里采用标准 CA 模型的近似。
-            [q2, dt, dt / 2.0],
-            [dt ** 2 / 4.0, dt / 2.0, dt]
-        ]) * q_var
+        # --- 水平面 (X-Y) 耦合更新 ---
+        # 索引参考: x(0), vx(1), ax(2) | y(3), vy(4), ay(5)
 
-        # 简化版 Q 块 (你原代码采用的近似)
-        q_simple = np.array([
-            [dt ** 5 / 20.0, dt ** 4 / 8.0, dt ** 3 / 6.0],
-            [dt ** 4 / 8.0, dt ** 3 / 3.0, dt ** 2 / 2.0],
-            [dt ** 3 / 6.0, dt ** 2 / 2.0, dt]
-        ]) * q_var
+        # 1. 位置更新 (XPos 由 XVel 和 YVel 共同决定)
+        F[0, 1] = sin_w / omega
+        F[0, 4] = -(1 - cos_w) / omega
 
+        F[3, 1] = (1 - cos_w) / omega
+        F[3, 4] = sin_w / omega
+
+        # 2. 速度更新 (XVel 由 XVel 和 YVel 旋转得到)
+        F[1, 1] = cos_w
+        F[1, 4] = -sin_w
+
+        F[4, 1] = sin_w
+        F[4, 4] = cos_w
+
+        # 3. 加速度处理
+        # 简单处理：加速度作为噪声驱动的状态保持，或者也可以旋转
+        # 这里保持加速度为独立的一阶马尔可夫过程 (衰减或保持)
+        # 稍微加入一点衰减，防止转弯结束后加速度发散
+        F[2, 2] = 1.0
+        F[5, 5] = 1.0
+
+        # --- 高度 (Z) 轴通常独立，按 CA 模型处理 ---
+        # z = z + vz*dt + 0.5*az*dt^2
+        F[6, 7] = dt
+        F[6, 8] = 0.5 * dt ** 2
+        F[7, 8] = dt
+
+        return F
+
+    def get_Q(self, dt, q_std):
+        """
+        生成过程噪声矩阵 Q
+        基于离散化白噪声加速度模型 (Discrete White Noise Acceleration)
+        """
         Q = np.zeros((self.dim, self.dim))
+        var = q_std ** 2
 
-        # 组装 9x9 Q 矩阵 (通常 Q 仅在加速度项有值，但 IMM 需要在所有维度有值)
-        # 我们使用你代码中隐式采用的 CA 离散化 Q 矩阵
-        for i in range(3):
-            start = i * 3
-            # 使用标准的 9D CA 模型的 Q 矩阵
-            Q[start:start + 3, start:start + 3] = q_simple  # 这里使用标准公式，比你的原公式更精确
+        # 对每个维度 (x, y, z) 填充 Q 块
+        # 对于 9D 状态 (p, v, a)，通常假设加速度的导数(jerk)是白噪声，
+        # 或者假设加速度本身是随机游走。这里使用简化的 CA Q 矩阵形式。
+
+        dt2 = dt ** 2
+        dt3 = dt ** 3
+        dt4 = dt ** 4
+
+        # 这是一个针对 (pos, vel, acc) 的典型 Q 块近似
+        # 假设加速度项由方差 var 的噪声驱动
+        q_block = np.array([
+            [dt ** 5 / 20, dt ** 4 / 8, dt ** 3 / 6],
+            [dt ** 4 / 8, dt ** 3 / 3, dt ** 2 / 2],
+            [dt ** 3 / 6, dt ** 2 / 2, dt]
+        ]) * var
+
+        for i in [0, 3, 6]:
+            Q[i:i + 3, i:i + 3] = q_block
 
         return Q
 
-    # --- IMM 核心逻辑 (interact 和 update 保留原逻辑，但使用修正后的函数) ---
     def interact(self):
-        """步骤 1: 交互/混合"""
-        # ... (与原代码保持一致) ...
-        EPS = 1e-20
+        """步骤 1: 交互 (Interaction)"""
         c_bar = np.dot(self.trans_prob.T, self.model_probs)
+        EPS = 1e-20  # 防止除零
 
         mixing_probs = np.zeros((self.M, self.M))
         for i in range(self.M):
@@ -124,58 +202,67 @@ class IMMFilter:
         return x_mixed, P_mixed, c_bar
 
     def update(self, z, dt):
-        """步骤 2 & 3: 预测与更新"""
-        models = []
-        for q_std in self.q_list:
-            models.append({
-                'F': self.get_F_CA_model(dt),
-                'Q': self.get_Q_CA_model(dt, q_std)
-            })
+        """步骤 2 & 3: 滤波更新 (Filtering Update)"""
 
-        EPS = 1e-20
+        # --- 关键修改：在这里分别生成不同的模型矩阵 ---
+        # 模型 0: CV
+        # 模型 1: CA
+        # 模型 2: CT
+
+        model_defs = [
+            {'F': self.get_F_CV(dt), 'Q': self.get_Q(dt, self.q_params[0])},
+            {'F': self.get_F_CA(dt), 'Q': self.get_Q(dt, self.q_params[1])},
+            {'F': self.get_F_CT(dt, omega=0.22), 'Q': self.get_Q(dt, self.q_params[2])}  # 设定转弯率
+        ]
+
         x_mixed, P_mixed, c_bar = self.interact()
+
         likelihoods = np.zeros(self.M)
+        EPS = 1e-50
 
         for i in range(self.M):
-            # --- 预测 ---
-            F = models[i]['F']
-            Q = models[i]['Q']
+            F = model_defs[i]['F']
+            Q = model_defs[i]['Q']
 
+            # 卡尔曼预测
             x_pred = F @ x_mixed[i]
             P_pred = F @ P_mixed[i] @ F.T + Q
 
-            # --- 更新 ---
-            y = z - self.H @ x_pred
+            # 测量残差
+            y_res = z - self.H @ x_pred
             S = self.H @ P_pred @ self.H.T + self.R
 
+            # 卡尔曼更新
             try:
                 S_inv = np.linalg.inv(S)
                 K = P_pred @ self.H.T @ S_inv
             except np.linalg.LinAlgError:
-                S_inv = np.eye(3) * 1e-6
                 K = np.zeros((self.dim, 3))
+                S_inv = np.eye(3)
 
-            self.x[i] = x_pred + K @ y
+            self.x[i] = x_pred + K @ y_res
+
+            # Joseph form 更新 P，保证正定性
             I_KH = np.eye(self.dim) - K @ self.H
-            # Joseph form update for stability
             self.P[i] = I_KH @ P_pred @ I_KH.T + K @ self.R @ K.T
 
-            # --- 计算似然 ---
+            # 计算似然 (Likelihood)
             S_det = np.linalg.det(S)
-            denom = np.sqrt(((2 * np.pi) ** 3 * S_det) + EPS)  # 添加EPS防止分母为零
-            mahalanobis = -0.5 * y.T @ S_inv @ y
+            denom = np.sqrt((2 * np.pi) ** 3 * S_det)
+            mahalanobis = -0.5 * y_res.T @ S_inv @ y_res
             likelihoods[i] = np.exp(mahalanobis) / (denom + EPS)
 
-        # --- 步骤 4: 更新模型概率 ---
+        # 步骤 4: 更新模型概率
         new_probs = likelihoods * c_bar
         sum_probs = np.sum(new_probs)
 
         if sum_probs < EPS:
-            self.model_probs = np.ones(self.M) / self.M
+            # 如果数值下溢，重置为均匀分布或保持上一时刻
+            self.model_probs = c_bar
         else:
             self.model_probs = new_probs / sum_probs
 
-        # --- 步骤 5: 融合状态 ---
+        # 步骤 5: 状态融合
         x_out = np.zeros(self.dim)
         for i in range(self.M):
             x_out += self.model_probs[i] * self.x[i]
